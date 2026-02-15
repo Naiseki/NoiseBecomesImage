@@ -1,7 +1,14 @@
 """
-スコア場の計算
-画像から密度スコア場と色スコア場を事前計算する
-サンプリング中はこのスコア場のみを参照し、元画像は直接参照しない
+マルチスケールスコア場の計算
+画像から複数スケールの密度スコア場と色スコア場を事前計算する
+
+各σについて:
+  p_σ = gaussian_blur(p, σ)
+  L_σ = log(p_σ)
+  score_σ = ∇L_σ
+
+サンプリング中はσを大→小へ連続的に切り替え、
+大きいσで大域構造を形成し、小さいσで細部を再構成する
 """
 
 import numpy as np
@@ -10,99 +17,137 @@ from dataclasses import dataclass
 
 
 @dataclass
-class ScoreField:
-    """スコア場を保持するデータクラス"""
-    score_pos: np.ndarray      # 密度スコア場 (H, W, 2) - (∇x, ∇y)
-    log_density_r: np.ndarray  # 赤チャンネルのlog密度 (H, W)
-    log_density_g: np.ndarray  # 緑チャンネルのlog密度 (H, W)
-    log_density_b: np.ndarray  # 青チャンネルのlog密度 (H, W)
+class MultiScaleScoreField:
+    """マルチスケールスコア場を保持するデータクラス"""
+    sigma_levels: np.ndarray               # (L,) σ値（大→小の順）
+    score_pos_scales: list[np.ndarray]     # L個の (H, W, 2) 密度スコア場
+    log_density_r_scales: list[np.ndarray]  # L個の (H, W) 赤チャンネルlog密度
+    log_density_g_scales: list[np.ndarray]  # L個の (H, W) 緑チャンネルlog密度
+    log_density_b_scales: list[np.ndarray]  # L個の (H, W) 青チャンネルlog密度
     width: int
     height: int
 
 
-def compute_log_probability(channel: np.ndarray, epsilon: float = 1e-8) -> np.ndarray:
+def _compute_probability_density(
+    channel: np.ndarray,
+    epsilon: float = 1e-8
+) -> np.ndarray:
     """
-    チャンネルの確率密度のlog値を計算
+    チャンネルからベース確率密度を計算
 
     Args:
         channel: 画像チャンネル (H, W)、値の範囲は [0, 1]
+        epsilon: ゼロ除算/log(0)を避けるための微小値
+
+    Returns:
+        確率密度 (H, W)
+    """
+    channel_with_epsilon = channel + epsilon
+    return channel_with_epsilon / np.sum(channel_with_epsilon)
+
+
+def _compute_blurred_log_density(
+    prob_density: np.ndarray,
+    sigma: float,
+    epsilon: float = 1e-8
+) -> np.ndarray:
+    """
+    確率密度をσでぼかしてからlog変換
+
+    Args:
+        prob_density: ベース確率密度 (H, W)
+        sigma: ガウシアンぼかしの標準偏差
         epsilon: log(0)を避けるための微小値
 
     Returns:
-        log確率密度 (H, W)
+        ぼかし後のlog確率密度 (H, W)
     """
-    # 確率密度の計算
-    # p(x,y) = (channel + ε) / Σ(channel + ε)
-    channel_with_epsilon = channel + epsilon
-    prob_density = channel_with_epsilon / np.sum(channel_with_epsilon)
-
-    # log確率
-    log_prob = np.log(prob_density)
-
-    return log_prob
+    blurred = gaussian_filter(prob_density, sigma=sigma)
+    return np.log(blurred + epsilon)
 
 
-def compute_gradient_field(log_prob: np.ndarray, sigma: float = 1.0) -> np.ndarray:
+def _compute_score_from_log_density(log_density: np.ndarray) -> np.ndarray:
     """
-    ガウシアン微分を使って勾配場を計算
+    log確率密度から勾配（スコア）を計算
+    ぼかし済みなので追加のスムージングは不要
 
     Args:
-        log_prob: log確率密度 (H, W)
-        sigma: ガウシアンフィルタの標準偏差
+        log_density: log確率密度 (H, W)
 
     Returns:
         勾配場 (H, W, 2) - (∇x, ∇y)
     """
-    # まずガウシアンぼかしを適用
-    smoothed = gaussian_filter(log_prob, sigma=sigma)
-
-    # 勾配を計算（中心差分）
     # np.gradientは (行方向, 列方向) = (y, x) の順番で返す
-    grad_y, grad_x = np.gradient(smoothed)
-
-    # (H, W, 2) の形式で返す: (∇x, ∇y)
-    gradient_field = np.stack([grad_x, grad_y], axis=-1)
-
-    return gradient_field
+    grad_y, grad_x = np.gradient(log_density)
+    return np.stack([grad_x, grad_y], axis=-1)
 
 
-def build_score_field(image: np.ndarray, gradient_sigma: float = 1.0) -> ScoreField:
+def build_multiscale_score_field(
+    image: np.ndarray,
+    sigma_max: float = 20.0,
+    sigma_min: float = 0.5,
+    num_scales: int = 10
+) -> MultiScaleScoreField:
     """
-    画像からスコア場を構築する（前処理）
+    画像からマルチスケールスコア場を構築する（前処理）
+
+    σ_maxからσ_minまでの等比数列でスケールを生成し、
+    各スケールでぼかした確率密度からスコア場を計算
 
     Args:
         image: RGB画像 (H, W, 3)、値の範囲は [0, 1]
-        gradient_sigma: 勾配計算時のガウシアンぼかしの標準偏差
+        sigma_max: 最大ぼかしσ（大域構造用）
+        sigma_min: 最小ぼかしσ（細部用）
+        num_scales: スケール数
 
     Returns:
-        ScoreField オブジェクト
+        MultiScaleScoreField オブジェクト
     """
     height, width = image.shape[:2]
 
-    # 輝度の計算
-    # Y = 0.299R + 0.587G + 0.114B
+    # 輝度の計算: Y = 0.299R + 0.587G + 0.114B
     luminance = (
-        0.299 * image[:, :, 0] +
-        0.587 * image[:, :, 1] +
-        0.114 * image[:, :, 2]
+        0.299 * image[:, :, 0]
+        + 0.587 * image[:, :, 1]
+        + 0.114 * image[:, :, 2]
     )
 
-    # 輝度からlog確率密度を計算
-    log_luminance = compute_log_probability(luminance)
+    # ベース確率密度の計算
+    prob_luminance = _compute_probability_density(luminance)
+    prob_r = _compute_probability_density(image[:, :, 0])
+    prob_g = _compute_probability_density(image[:, :, 1])
+    prob_b = _compute_probability_density(image[:, :, 2])
 
-    # 密度スコア場を計算
-    score_pos = compute_gradient_field(log_luminance, sigma=gradient_sigma)
+    # σレベルの生成（大 → 小、等比数列）
+    sigma_levels = np.geomspace(sigma_max, sigma_min, num_scales)
 
-    # 各RGBチャンネルのlog密度を計算
-    log_density_r = compute_log_probability(image[:, :, 0])
-    log_density_g = compute_log_probability(image[:, :, 1])
-    log_density_b = compute_log_probability(image[:, :, 2])
+    # 各スケールでスコア場を事前計算
+    score_pos_scales: list[np.ndarray] = []
+    log_density_r_scales: list[np.ndarray] = []
+    log_density_g_scales: list[np.ndarray] = []
+    log_density_b_scales: list[np.ndarray] = []
 
-    return ScoreField(
-        score_pos=score_pos,
-        log_density_r=log_density_r,
-        log_density_g=log_density_g,
-        log_density_b=log_density_b,
+    for sigma in sigma_levels:
+        # 輝度密度をσでぼかしてスコア場を計算
+        log_lum = _compute_blurred_log_density(prob_luminance, sigma)
+        score = _compute_score_from_log_density(log_lum)
+        score_pos_scales.append(score)
+
+        # 各色チャンネルのlog密度もσでぼかして計算
+        log_r = _compute_blurred_log_density(prob_r, sigma)
+        log_g = _compute_blurred_log_density(prob_g, sigma)
+        log_b = _compute_blurred_log_density(prob_b, sigma)
+
+        log_density_r_scales.append(log_r)
+        log_density_g_scales.append(log_g)
+        log_density_b_scales.append(log_b)
+
+    return MultiScaleScoreField(
+        sigma_levels=sigma_levels,
+        score_pos_scales=score_pos_scales,
+        log_density_r_scales=log_density_r_scales,
+        log_density_g_scales=log_density_g_scales,
+        log_density_b_scales=log_density_b_scales,
         width=width,
-        height=height
+        height=height,
     )

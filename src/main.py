@@ -6,7 +6,7 @@ Noise Becomes Image - スコアベース粒子システムによる画像再構�
 import streamlit as st
 import numpy as np
 from src.utils import load_and_preprocess_image
-from src.score_field import build_score_field
+from src.score_field import build_multiscale_score_field
 from src.particle_system import ParticleSystem, ParticleSystemConfig
 from src.renderer import render_particles, GifRecorder
 
@@ -106,13 +106,33 @@ def render_sidebar() -> dict:
         help="描画時のガウシアンぼかしの強さ"
     )
 
-    params["gradient_sigma"] = st.sidebar.slider(
-        "勾配計算時のぼかし",
-        min_value=0.5,
-        max_value=3.0,
-        value=1.0,
+    st.sidebar.subheader("マルチスケール設定")
+
+    params["sigma_max"] = st.sidebar.slider(
+        "σ_max（大域構造）",
+        min_value=5.0,
+        max_value=50.0,
+        value=20.0,
+        step=1.0,
+        help="最大ぼかしσ。大きいほど大域的な構造を先に形成する"
+    )
+
+    params["sigma_min"] = st.sidebar.slider(
+        "σ_min（細部）",
+        min_value=0.1,
+        max_value=5.0,
+        value=0.5,
         step=0.1,
-        help="スコア場計算時のガウシアンぼかし"
+        help="最小ぼかしσ。小さいほど細部まで再構成する"
+    )
+
+    params["num_scales"] = st.sidebar.slider(
+        "スケール数",
+        min_value=3,
+        max_value=20,
+        value=10,
+        step=1,
+        help="σ_maxからσ_minまでのスケール分割数"
     )
 
     params["save_interval"] = st.sidebar.slider(
@@ -174,9 +194,12 @@ def main() -> None:
                 image = load_and_preprocess_image(uploaded_file)
                 st.session_state.original_image = image
 
-                # スコア場を構築
-                score_field = build_score_field(
-                    image, gradient_sigma=params["gradient_sigma"]
+                # マルチスケールスコア場を構築
+                score_field = build_multiscale_score_field(
+                    image,
+                    sigma_max=params["sigma_max"],
+                    sigma_min=params["sigma_min"],
+                    num_scales=params["num_scales"],
                 )
                 st.session_state.score_field = score_field
 
@@ -256,7 +279,10 @@ def main() -> None:
                     # 進捗更新
                     progress = (step + 1) / params["total_steps"]
                     progress_bar.progress(progress)
-                    status_text.text(f"ステップ {step + 1} / {params['total_steps']}")
+                    status_text.text(
+                        f"ステップ {step + 1} / {params['total_steps']}"
+                        f"  |  σ = {state['blur_sigma']:.2f}"
+                    )
 
                     # GIF記録
                     if step % params["save_interval"] == 0:
